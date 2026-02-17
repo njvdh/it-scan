@@ -1,31 +1,62 @@
 #!/bin/bash
 # it-scan - Infrastructure & Network Inventory Tool
-# Ver: 2.0 | Repository: https://github.com/njvdh/it-scan
+# Ver: 2.3 | Added: SSH Init & Privacy Config
 
-# --- Configuration ---
-LINUX_HOSTS="10.0.0.10 10.0.0.11 10.0.0.12 10.0.0.15 10.0.0.17"
-APS="10.0.1.2 10.0.1.3 10.0.1.4 10.0.1.5 10.0.1.6 10.0.1.7"
-SNMP_COMMUNITY="public"
+# --- Load Configuration ---
+# Look for config in /etc or current directory
+CONF_FILE="/etc/it-scan.conf"
+[ ! -f "$CONF_FILE" ] && CONF_FILE="$(dirname "$0")/it-scan.conf"
+
+if [ -f "$CONF_FILE" ]; then
+    source "$CONF_FILE"
+else
+    echo "Error: Configuration file not found ($CONF_FILE)"
+    echo "Please create it or use 'init' to set up paths."
+    exit 1
+fi
+
+# --- Functions ---
+
+init_ssh() {
+    echo "--- Initializing SSH Key-Based Access ---"
+    # Create key if it doesn't exist
+    if [ ! -f ~/.ssh/id_ed25519.pub ]; then
+        echo "Generating new Ed25519 keypair..."
+        ssh-keygen -t ed25519 -N "" -f ~/.ssh/id_ed25519
+    fi
+
+    for target in $LINUX_HOSTS; do
+        echo "Checking $target..."
+        # Check if we already have access
+        ssh -q -o BatchMode=yes -o ConnectTimeout=2 root@$target "exit" 2>/dev/null
+        if [ $? -ne 0 ]; then
+            echo "Requesting access to $target (password required once):"
+            ssh-copy-id -o StrictHostKeyChecking=no root@$target
+        else
+            echo "Access to $target already OK."
+        fi
+    done
+    echo "--- SSH Init Complete ---"
+}
 
 inventory_task() {
     echo "=========================================================="
-    echo " HOST: $(hostname -f) | IP: $(hostname -I | awk '{print $1}')"
+#    echo " HOST: $(hostname -f) | IP: $(hostname -I | awk '{print $1}')"
+#    echo " HOST: $(hostname -f) | IP: ${SSH_CONNECTION%% *}"
+    echo " HOST: $(hostname -f) | IP: $(echo $SSH_CONNECTION | awk '{print $3}')"
     echo "=========================================================="
     uptime -p
 
-    # Storage Check
     echo "--- Storage ---"
     df -h | grep -E '^/dev/|^rpool|^HDD'
 
-    # Proxmox/ZFS Check
     if command -v qm >/dev/null 2>&1; then
         echo "--- Proxmox VMs ---"
         qm list | grep "running" || echo "No active VMs"
         echo "--- ZFS Pools ---"
-        zpool list -H | awk '{print $1 " -> " $10}'
+        zpool list -H | awk '{print $1 " -> " $10}' 2>/dev/null
     fi
 
-    # Incus Check
     if command -v incus >/dev/null 2>&1; then
         echo "--- Incus Containers ---"
         incus list --columns ns4 --format csv | sed 's/,/ -> /'
@@ -36,47 +67,45 @@ scan_wifi() {
     echo "=== RUCKUS WIFI STATUS (SNMP) ==="
     for ap in $APS; do
         # Get System Name
-        NAME=$(snmpget -v2c -c "$SNMP_COMMUNITY" "$ap" .1.3.6.1.2.1.1.5.0 -Oqv 2>/dev/null | tr -d '"')
+        NAME=$(snmpget -v2c -c "$SNMP_COMMUNITY" "$ap" .1.3.6.1.2.1.1.5.0 -Oqv -t 1 2>/dev/null | tr -d '"')
         
         if [ -z "$NAME" ]; then
-            echo "AP $ap | OFFLINE or SNMP Timeout"
+            echo "AP $ap | TIMEOUT (No SNMP response)"
             continue
         fi
 
-        # Try New Ruckus OID (R350/R550 series)
+        # Try New Ruckus OID (R350/R550)
         CLIENTS=$(snmpget -v2c -c "$SNMP_COMMUNITY" "$ap" .1.3.6.1.4.1.25053.1.15.1.1.1.15.13.0 -Oqv 2>/dev/null)
 
-        # Fallback to Old Ruckus OID (Older ZoneFlex)
+        # Fallback to Old Ruckus OID
         if [[ -z "$CLIENTS" || "$CLIENTS" == "No Such Object"* ]]; then
             CLIENTS=$(snmpget -v2c -c "$SNMP_COMMUNITY" "$ap" .1.3.6.1.4.1.25053.1.1.1.1.1.1.1.14 -Oqv 2>/dev/null)
         fi
 
-        # Cleanup output
-        if [[ "$CLIENTS" == "No Such Object"* || -z "$CLIENTS" ]]; then
-            CLIENTS="0"
-        fi
-
-        echo "AP $ap | $NAME | Clients: $CLIENTS"
+        echo "AP $ap | $NAME | Clients: ${CLIENTS:-0}"
     done
 }
 
-# Main Logic
+# --- Main Logic ---
+
 case "$1" in
+    init)
+        init_ssh
+        ;;
     wifi)
         scan_wifi
         ;;
     linux)
         for target in $LINUX_HOSTS; do
-            ssh -q -t -o ConnectTimeout=2 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null root@$target "$(declare -f inventory_task); inventory_task"
+            ssh -q -t -o ConnectTimeout=2 -o StrictHostKeyChecking=no root@$target "$(declare -f inventory_task); inventory_task"
         done
         ;;
-    all|*)
-        if [ "$1" == "all" ]; then
-            $0 linux
-            $0 wifi
-        else
-            echo "Usage: $0 {linux|wifi|all}"
-            exit 1
-        fi
+    all)
+        $0 linux
+        $0 wifi
+        ;;
+    *)
+        echo "Usage: $0 {init|linux|wifi|all}"
+        exit 1
         ;;
 esac
